@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+out/
+.env
+.dev.vars
+cookies.txt
+worker/node_modules/
+worker/dist/
+worker/.wrangler/
