@@ -3,6 +3,7 @@
 Run:  python -m unittest discover -s tests -v
 """
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -113,6 +114,145 @@ class ProcessTests(unittest.TestCase):
             self.assertTrue(P.is_supported_url(u), u)
         for u in bad:
             self.assertFalse(P.is_supported_url(u), u)
+
+
+class FakeTelegram:
+    """Records calls instead of talking to Telegram."""
+    instances = []
+
+    def __init__(self, token, chat_id):
+        self.calls = []
+        FakeTelegram.instances.append(self)
+
+    def edit(self, message_id, text, keyboard=None):
+        self.calls.append(("edit", message_id, text, keyboard))
+        return message_id
+
+    def message(self, text, keyboard=None):
+        self.calls.append(("message", text, keyboard))
+        return 555
+
+    def delete(self, message_id):
+        self.calls.append(("delete", message_id))
+        return True
+
+    def action(self, kind):
+        self.calls.append(("action", kind))
+
+    def username(self):
+        return "mediaflobot"
+
+    def send_file(self, path, kind, caption="", title=""):
+        self.calls.append(("send_file", path.suffix, kind, caption, title))
+
+
+class UxTests(unittest.TestCase):
+    def test_progress_bar(self):
+        self.assertEqual(P.progress_bar(40), "▰▰▰▰▱▱▱▱▱▱ 40%")
+        self.assertEqual(P.progress_bar(-5), "▱▱▱▱▱▱▱▱▱▱ 0%")
+
+    def test_caption_escapes_html(self):
+        cap = P.build_caption("A <b> & C", "▶️ YouTube  ·  🎵 MP3 Audio", "mediaflobot")
+        self.assertIn("<b>A &lt;b&gt; &amp; C</b>", cap)
+        self.assertTrue(cap.endswith("⚡ via @mediaflobot"))
+
+    def test_friendly_errors(self):
+        cases = {
+            "ERROR: [youtube] x: Sign in to confirm you're not a bot": "bot check",
+            "ERROR: [instagram] x: This account is private": "private",
+            "ERROR: [youtube] x: Video unavailable": "unavailable",
+            "ERROR: HTTP Error 429: Too Many Requests": "rate-limiting",
+            "ERROR: [youtube] x: The uploader has not made this video available in your country": "region",
+        }
+        for out, needle in cases.items():
+            with self.subTest(out=out):
+                self.assertIn(needle, P.friendly_download_error(out) or "")
+        self.assertIsNone(P.friendly_download_error("ERROR: something odd"))
+
+    def test_progress_throttles_edits(self):
+        t = [0.0]
+        tg = FakeTelegram("t", 1)
+        prog = P.Progress(tg, 8, "line", min_interval=3.0, clock=lambda: t[0])
+        prog.download_hook(10)       # first edit goes through
+        prog.download_hook(50)       # too soon
+        t[0] = 5
+        prog.download_hook(50)       # ok
+        prog.download_hook(50)       # same bar
+        prog.update("⚙️ <b>Processing…</b>", 70, force=True)
+        edits = [c for c in tg.calls if c[0] == "edit"]
+        self.assertEqual(len(edits), 3)
+        self.assertIn("Downloading", edits[0][2])
+        self.assertIn("▰▰▰", edits[1][2])
+
+
+class GithubJobTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.sample = make_sample(self.tmp / "s.mp4", seconds=3)
+        self.released = []
+        self._orig = (P.Telegram, P.download, P.release_slot)
+        FakeTelegram.instances.clear()
+        P.Telegram = FakeTelegram
+        P.release_slot = lambda ctx: self.released.append(ctx.get("release_token"))
+
+    def tearDown(self):
+        P.Telegram, P.download, P.release_slot = self._orig
+        self._tmp.cleanup()
+
+    def run_job(self, action="mp3", options=None):
+        event = {"client_payload": {"chat_id": 99, "url": "https://youtu.be/x", "action": action,
+                                    "options": options or {},
+                                    "ctx": {"job_id": "abcdef123456", "status_message_id": 8, "user_id": 42,
+                                            "platform": "YouTube", "platform_emoji": "▶️",
+                                            "label": "🎵 MP3 Audio", "bot_username": "mediaflobot",
+                                            "release_url": "https://w.dev/release", "release_token": "tok"}}}
+        ev = self.tmp / "event.json"
+        ev.write_text(json.dumps(event))
+        env = {"GITHUB_EVENT_PATH": str(ev), "TELEGRAM_BOT_TOKEN": "123:abc", "RUNNER_TEMP": str(self.tmp)}
+        old = {k: P.os.environ.get(k) for k in env}
+        P.os.environ.update(env)
+        try:
+            return P.run_github_job(), FakeTelegram.instances[-1].calls
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    P.os.environ.pop(k, None)
+                else:
+                    P.os.environ[k] = v
+
+    def test_success_flow_edits_status_sends_file_and_deletes_status(self):
+        def fake_download(url, workdir, **kw):
+            (workdir / "title.txt").write_text("My <Clip>\n")
+            kw["on_progress"](100.0)
+            dst = workdir / "source.mp4"
+            shutil.copy(self.sample, dst)
+            return dst
+        P.download = fake_download
+        rc, calls = self.run_job()
+        self.assertEqual(rc, 0)
+        stages = [c[2] for c in calls if c[0] == "edit"]
+        for word in ("Preparing", "Downloading", "Processing", "Uploading"):
+            self.assertTrue(any(word in s for s in stages), word)
+        self.assertTrue(all(c[1] == 8 for c in calls if c[0] == "edit"), "always the same status message")
+        self.assertIn(("action", "audio"), calls)
+        sent = [c for c in calls if c[0] == "send_file"][0]
+        self.assertEqual(sent[1:3], (".mp3", "audio"))
+        self.assertIn("<b>My &lt;Clip&gt;</b>", sent[3])
+        self.assertIn("⚡ via @mediaflobot", sent[3])
+        self.assertEqual(calls[-1], ("delete", 8))
+        self.assertEqual(self.released, ["tok"])
+
+    def test_user_error_shows_try_again(self):
+        def fake_download(url, workdir, **kw):
+            raise P.UserError("🔐 This post is private or needs a login, so it can't be downloaded.")
+        P.download = fake_download
+        rc, calls = self.run_job()
+        self.assertEqual(rc, 0)
+        last = [c for c in calls if c[0] == "edit"][-1]
+        self.assertIn("private", last[2])
+        self.assertEqual(last[3], [[{"text": "🔁 Try again", "callback_data": "r:abcdef123456"}]])
+        self.assertEqual(self.released, ["tok"])
 
 
 if __name__ == "__main__":

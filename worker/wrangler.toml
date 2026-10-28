@@ -1,14 +1,14 @@
-name = "social-media-bot"
+name = "mediaflow-bot"
 main = "src/index.ts"
 compatibility_date = "2026-10-01"
 workers_dev = true
 
-# Short-lived conversation state only (10-minute TTL). No media is ever stored.
+# Short-lived state only (every key has a TTL: menus 30 min, job lock 15 min). No media is ever stored.
 # Create with:  npx wrangler kv namespace create STATE
 # then paste the printed id below.
 [[kv_namespaces]]
 binding = "STATE"
-id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+id = "1dfca3c0ad7c4edfb5326c546070392d"
 
 [vars]
 # Comma-separated Telegram user ids allowed to use the bot. Empty = anyone.
@@ -17,6 +17,8 @@ ALLOWED_USER_IDS = ""
 DEFAULT_WATERMARK = ""
 # Frames action: how many seconds (max 60) to extract at 1 frame/second.
 FRAMES_MAX_SECONDS = "60"
+# Per-user cooldown after a job starts (seconds). Plus max 1 active job per user.
+COOLDOWN_SECONDS = "20"
 
 # Secrets (set with `npx wrangler secret put NAME`, never commit them):
 #   TELEGRAM_BOT_TOKEN, WEBHOOK_SECRET, GITHUB_TOKEN, GITHUB_REPO

@@ -99,38 +99,105 @@ def human(n: int) -> str:
 
 # ----------------------------------------------------------------------------- download
 
-def download(url: str, workdir: Path, *, audio_only: bool = False,
-             cookies_file: Path | None = None) -> Path:
-    """Download one media item with yt-dlp into workdir and return the file path."""
+QUALITY_FORMATS = {
+    # Prefer something that already fits Telegram, then fall back to the cap, then anything.
+    "best": "bv*[height<=1080][filesize<45M]+ba/b[height<=1080][filesize<48M]/"
+            "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b",
+    "720": "bv*[height<=720][filesize<45M]+ba/b[height<=720][filesize<48M]/"
+           "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b",
+    "480": "bv*[height<=480]+ba/b[height<=480]/bv*[height<=720]+ba/b[height<=720]/bv*+ba/b",
+}
+
+# (pattern in yt-dlp output, friendly message for the user)
+DOWNLOAD_ERRORS = (
+    (r"confirm you.re not a bot|sign in to confirm", "🤖 The site asked for a bot check and blocked the "
+     "download server. The bot owner can fix this by adding a YT_DLP_COOKIES secret."),
+    (r"private (video|account|post)|this account is private|login required|log in|"
+     r"you need to log in|requires authentication|members.only",
+     "🔐 This post is private or needs a login, so it can't be downloaded."),
+    (r"age.restricted|confirm your age|inappropriate for some users",
+     "🔞 This video is age-restricted and needs a signed-in account."),
+    (r"available in your country|geo.?restrict|blocked it in your country",
+     "🌍 This video isn't available in the download server's region."),
+    (r"video unavailable|has been removed|does not exist|404|no longer available|deleted",
+     "🚫 This video is unavailable. It may have been removed or the link is wrong."),
+    (r"no video formats found|there is no video in this post|unsupported url",
+     "🎞 I couldn't find a downloadable video in that post."),
+    (r"live event|is live|premieres in", "📡 Live streams and premieres can't be downloaded."),
+    (r"rate.?limit|too many requests|http error 429",
+     "🚦 The site is rate-limiting downloads right now. Please try again in a few minutes."),
+    (r"cookies", "🔐 The site requires a login (cookies) for this link."),
+)
+
+PROGRESS_PREFIX = "MFPROG"
+
+
+def friendly_download_error(output: str) -> str | None:
+    for pattern, message in DOWNLOAD_ERRORS:
+        if re.search(pattern, output, re.I):
+            return message
+    return None
+
+
+def download(url: str, workdir: Path, *, audio_only: bool = False, quality: str = "720",
+             cookies_file: Path | None = None, on_progress=None) -> Path:
+    """Download one media item with yt-dlp into workdir and return the file path.
+
+    on_progress(percent: float) is called while downloading. The title (if known)
+    is written to workdir/title.txt.
+    """
     if not is_supported_url(url):
-        raise UserError("Unsupported link. Send a YouTube, TikTok, Instagram, Facebook or X link.")
+        raise UserError("🔗 Unsupported link. Send a YouTube, TikTok, Instagram, Facebook or X link.")
     out_tmpl = str(workdir / "source.%(ext)s")
-    cmd = ["yt-dlp", "--no-playlist", "--no-progress", "--restrict-filenames",
-           "--no-warnings", "--max-filesize", "1500M", "-o", out_tmpl]
+    cmd = ["yt-dlp", "--no-playlist", "--restrict-filenames", "--no-warnings", "--newline",
+           "--progress", "--progress-template", f"download:{PROGRESS_PREFIX} %(progress._percent_str)s",
+           "--print-to-file", "%(title)s", str(workdir / "title.txt"),
+           "--max-filesize", "1500M", "-o", out_tmpl]
     if audio_only:
         cmd += ["-f", "bestaudio/best"]
     else:
-        # Prefer something that already fits Telegram, then fall back to <=720p, then anything.
-        cmd += ["-f", "bv*[height<=720][filesize<45M]+ba/b[height<=720][filesize<48M]/"
-                      "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b",
+        cmd += ["-f", QUALITY_FORMATS.get(str(quality), QUALITY_FORMATS["720"]),
                 "--merge-output-format", "mp4"]
     if cookies_file:
         cmd += ["--cookies", str(cookies_file)]
     cmd.append(url)
-    try:
-        run(cmd)
-    except RuntimeError as e:
-        msg = str(e)
-        if re.search(r"(login|sign in|cookies|private|confirm you.re not a bot|rate.limit)", msg, re.I):
-            raise UserError("The site refused the download (login, private post, or bot check). "
-                            "The bot owner can add a YT_DLP_COOKIES secret to fix this.") from e
-        if "File is larger than max-filesize" in msg:
-            raise UserError("That video is too large to process.") from e
-        raise
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    tail: list[str] = []
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        line = line.rstrip()
+        if line.startswith(PROGRESS_PREFIX):
+            m = re.search(r"([\d.]+)%", line)
+            if m and on_progress:
+                try:
+                    on_progress(float(m.group(1)))
+                except Exception as e:  # progress is cosmetic; never fail the job over it
+                    print(f"progress callback failed: {e}", file=sys.stderr)
+            continue
+        tail = (tail + [line])[-40:]
+    rc = proc.wait()
+    output = "\n".join(tail)
+    if rc != 0:
+        if "File is larger than max-filesize" in output:
+            raise UserError("📦 That video is too large to process (over 1.5 GB).")
+        friendly = friendly_download_error(output)
+        print("yt-dlp failed:\n" + "\n".join(tail[-15:]), file=sys.stderr)
+        if friendly:
+            raise UserError(friendly)
+        raise RuntimeError(f"yt-dlp failed (exit {rc})")
     files = [p for p in workdir.glob("source.*") if p.suffix not in (".part", ".ytdl")]
     if not files:
-        raise UserError("Nothing was downloaded from that link.")
+        raise UserError("🎞 Nothing was downloaded from that link.")
     return max(files, key=lambda p: p.stat().st_size)
+
+
+def read_title(workdir: Path) -> str:
+    try:
+        lines = (workdir / "title.txt").read_text(encoding="utf-8").strip().splitlines()
+        return lines[0].strip()[:200] if lines else ""
+    except OSError:
+        return ""
 
 
 # ----------------------------------------------------------------------------- actions
@@ -162,7 +229,7 @@ def _encode_video(src: Path, dst: Path, vf: str | None = None, *, max_height: in
 def to_mp3(src: Path, workdir: Path, bitrate_kbps: int = 192) -> Path:
     """Extract audio as MP3, lowering the bitrate if needed to fit Telegram's limit."""
     if not has_audio(src):
-        raise UserError("This media has no audio track.")
+        raise UserError("🔇 This media has no audio track, so there's nothing to convert to MP3.")
     duration = probe_duration(src)
     if duration > 0:
         max_kbps = int(TARGET_BYTES * 8 / duration / 1000)
@@ -241,7 +308,7 @@ def fit_video(path: Path, workdir: Path) -> Path:
         if out.stat().st_size <= TARGET_BYTES:
             return out
     raise UserError(f"The video is too long to fit Telegram's 50 MB bot limit "
-                    f"({duration / 60:.0f} min). Try 'Convert to MP3' or a shorter clip.")
+                    f"({duration / 60:.0f} min). Try 🎵 MP3 Audio or a shorter clip.")
 
 
 def process(src: Path, workdir: Path, action: str, options: dict) -> tuple[Path, str]:
@@ -267,6 +334,30 @@ def process(src: Path, workdir: Path, action: str, options: dict) -> tuple[Path,
 
 # ----------------------------------------------------------------------------- telegram
 
+def esc(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def progress_bar(pct: float, width: int = 10) -> str:
+    p = max(0, min(100, round(pct)))
+    filled = round(p / 100 * width)
+    return "▰" * filled + "▱" * (width - filled) + f" {p}%"
+
+
+def status_text(stage: str, pct: float, platform_line: str, note: str = "") -> str:
+    text = f"{stage}\n{progress_bar(pct)}\n\n{platform_line}"
+    return text + (f"\n\n<i>{note}</i>" if note else "")
+
+
+def build_caption(title: str, platform_line: str, bot_username: str) -> str:
+    parts = []
+    if title:
+        parts.append(f"<b>{esc(title[:200])}</b>")
+    parts.append(platform_line)
+    parts.append(f"⚡ via @{esc(bot_username)}" if bot_username else "⚡ via MediaFlow")
+    return "\n".join(parts)
+
+
 class Telegram:
     def __init__(self, token: str, chat_id: int | str):
         import requests  # only needed when actually talking to Telegram
@@ -285,39 +376,100 @@ class Telegram:
             raise RuntimeError(f"Telegram {method} error: {body.get('description', 'unknown')}")
         return body["result"]
 
-    def message(self, text: str) -> int | None:
+    def try_call(self, method: str, data: dict) -> dict | None:
         try:
-            return self._call("sendMessage", {"chat_id": self.chat_id, "text": text})["message_id"]
+            return self._call(method, data)
         except RuntimeError as e:
             print(e, file=sys.stderr)
             return None
 
-    def edit(self, message_id: int | None, text: str) -> None:
-        if message_id is None:
-            self.message(text)
-            return
-        try:
-            self._call("editMessageText", {"chat_id": self.chat_id, "message_id": message_id, "text": text})
-        except RuntimeError:
-            self.message(text)
+    def username(self) -> str:
+        me = self.try_call("getMe", {})
+        return (me or {}).get("username", "")
 
-    def send_file(self, path: Path, kind: str, caption: str = "") -> None:
+    def message(self, text: str, keyboard: list | None = None) -> int | None:
+        data = {"chat_id": self.chat_id, "text": text, "parse_mode": "HTML",
+                "link_preview_options": json.dumps({"is_disabled": True})}
+        if keyboard:
+            data["reply_markup"] = json.dumps({"inline_keyboard": keyboard})
+        res = self.try_call("sendMessage", data)
+        return res["message_id"] if res else None
+
+    def edit(self, message_id: int | None, text: str, keyboard: list | None = None) -> int | None:
+        """Edit the status message (falls back to a new message). Returns the message id used."""
+        if message_id is None:
+            return self.message(text, keyboard)
+        data = {"chat_id": self.chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML",
+                "link_preview_options": json.dumps({"is_disabled": True}),
+                "reply_markup": json.dumps({"inline_keyboard": keyboard or []})}
+        try:
+            self._call("editMessageText", data)
+            return message_id
+        except RuntimeError as e:
+            if "message is not modified" in str(e):
+                return message_id
+            return self.message(text, keyboard)
+
+    def delete(self, message_id: int | None) -> bool:
+        if message_id is None:
+            return False
+        return self.try_call("deleteMessage", {"chat_id": self.chat_id, "message_id": message_id}) is not None
+
+    def action(self, kind: str) -> None:
+        chat_action = {"video": "upload_video", "audio": "upload_voice"}.get(kind, "upload_document")
+        self.try_call("sendChatAction", {"chat_id": self.chat_id, "action": chat_action})
+
+    def send_file(self, path: Path, kind: str, caption: str = "", title: str = "") -> None:
         if path.stat().st_size > TELEGRAM_LIMIT_BYTES:
-            raise UserError(f"Result is {human(path.stat().st_size)}, over Telegram's 50 MB bot limit.")
+            raise UserError(f"📦 The result is {human(path.stat().st_size)}, over Telegram's 50 MB bot limit.")
         method, field = {"video": ("sendVideo", "video"), "audio": ("sendAudio", "audio")}.get(
             kind, ("sendDocument", "document"))
-        data = {"chat_id": self.chat_id, "caption": caption[:1000]}
+        data = {"chat_id": self.chat_id, "caption": caption[:1024], "parse_mode": "HTML"}
         if kind == "video":
             data["supports_streaming"] = "true"
+        if kind == "audio" and title:
+            data["title"] = title[:64]
+        name = path.name
+        if title:
+            safe = re.sub(r"[^\w\- ]+", "", title).strip().replace(" ", "_")[:60]
+            if safe:
+                name = f"{safe}{path.suffix}"
         try:
             with path.open("rb") as fh:
-                self._call(method, data, {field: (path.name, fh)})
+                self._call(method, data, {field: (name, fh)})
         except RuntimeError:
             if method == "sendDocument":
                 raise
             with path.open("rb") as fh:  # fall back to plain file upload
-                self._call("sendDocument", {"chat_id": self.chat_id, "caption": caption[:1000]},
-                           {"document": (path.name, fh)})
+                self._call("sendDocument", {"chat_id": self.chat_id, "caption": caption[:1024],
+                                            "parse_mode": "HTML"}, {"document": (name, fh)})
+
+
+class Progress:
+    """Edits one status message through the job's stages, throttled to avoid Telegram limits."""
+
+    def __init__(self, tg: Telegram, message_id: int | None, platform_line: str,
+                 min_interval: float = 3.0, clock=None):
+        import time
+        self._clock = clock or time.monotonic
+        self.tg = tg
+        self.message_id = message_id
+        self.platform_line = platform_line
+        self.min_interval = min_interval
+        self._last_time = -1e9
+        self._last_bar = ""
+
+    def update(self, stage: str, pct: float, note: str = "", force: bool = False) -> None:
+        bar = progress_bar(pct)
+        now = self._clock()
+        if not force and (bar == self._last_bar or now - self._last_time < self.min_interval):
+            return
+        self._last_bar, self._last_time = bar, now
+        self.message_id = self.tg.edit(self.message_id, status_text(stage, pct, self.platform_line, note))
+
+    def download_hook(self, pct: float) -> None:
+        # Downloading spans 10% → 60% of the overall bar.
+        self.update("⏳ <b>Downloading…</b>", 10 + pct * 0.5)
 
 
 # ----------------------------------------------------------------------------- entrypoints
@@ -331,11 +483,26 @@ def load_job_from_github_event() -> dict:
     payload = event.get("client_payload") or event.get("inputs") or {}
     if isinstance(payload.get("options"), str):
         payload["options"] = json.loads(payload["options"] or "{}")
-    # Hide the user's link and chat id from public Actions logs.
-    for secret in (payload.get("url"), payload.get("chat_id")):
+    ctx = payload.get("ctx") or {}
+    # Hide the user's link, chat id and release token from public Actions logs.
+    for secret in (payload.get("url"), payload.get("chat_id"), ctx.get("release_token"),
+                   ctx.get("user_id")):
         if secret:
             print(f"::add-mask::{secret}", flush=True)
     return payload
+
+
+def release_slot(ctx: dict) -> None:
+    """Tell the Worker this user's job finished so they can start another one."""
+    url, token = ctx.get("release_url"), ctx.get("release_token")
+    if not url or not token or not str(url).startswith("https://"):
+        return
+    try:
+        import requests
+        r = requests.post(url, json={"user_id": ctx.get("user_id"), "token": token}, timeout=15)
+        print(f"release: HTTP {r.status_code}")
+    except Exception as e:
+        print(f"release failed: {type(e).__name__}", file=sys.stderr)
 
 
 def run_github_job() -> int:
@@ -345,11 +512,22 @@ def run_github_job() -> int:
     url = str(job.get("url", ""))
     action = str(job.get("action", ""))
     options = job.get("options") or {}
+    ctx = job.get("ctx") or {}
     if not token or not re.fullmatch(r"-?\d+", chat_id) or action not in ACTIONS:
         print("Invalid job payload or missing TELEGRAM_BOT_TOKEN", file=sys.stderr)
+        release_slot(ctx)
         return 1
     tg = Telegram(token, chat_id)
-    status = tg.message(f"⏳ Processing ({action})… this usually takes 1–3 minutes.")
+    platform_line = f"{ctx.get('platform_emoji', '🎬')} {esc(str(ctx.get('platform', 'Media')))}  ·  " \
+                    f"{esc(str(ctx.get('label', action)))}"
+    status_id = ctx.get("status_message_id")
+    status_id = int(status_id) if str(status_id or "").isdigit() else None
+    job_id = str(ctx.get("job_id") or "")
+    retry_kb = [[{"text": "🔁 Try again", "callback_data": f"r:{job_id}"}]] if re.fullmatch(
+        r"[a-z0-9]{6,16}", job_id) else None
+    prog = Progress(tg, status_id, platform_line)
+    prog.update("🔧 <b>Preparing…</b>", 5, "Server is ready, fetching your media.", force=True)
+
     workdir = Path(tempfile.mkdtemp(prefix="job_", dir=os.environ.get("RUNNER_TEMP")))
     try:
         cookies = None
@@ -357,23 +535,37 @@ def run_github_job() -> int:
             cookies = workdir / "cookies.txt"
             cookies.write_text(os.environ["YT_DLP_COOKIES"])
             cookies.chmod(0o600)
-        src = download(url, workdir, audio_only=(action == "mp3"), cookies_file=cookies)
+        prog.update("⏳ <b>Downloading…</b>", 10, force=True)
+        src = download(url, workdir, audio_only=(action == "mp3"), quality=str(options.get("quality") or "720"),
+                       cookies_file=cookies, on_progress=prog.download_hook)
         if cookies:
             cookies.unlink(missing_ok=True)
+        print(f"downloaded {human(src.stat().st_size)}")
+        title = read_title(workdir)
+        prog.update("⚙️ <b>Processing…</b>", 70, "Applying your edit with ffmpeg.", force=True)
         result, kind = process(src, workdir, action, options)
-        tg.edit(status, f"📤 Uploading {human(result.stat().st_size)}…")
-        tg.send_file(result, kind, caption=f"✅ {action}")
-        tg.edit(status, "✅ Done. Nothing was stored; all files were deleted.")
+        print(f"processed -> {kind} {human(result.stat().st_size)}")
+        prog.update("📤 <b>Uploading…</b>", 90, f"Sending {human(result.stat().st_size)} to Telegram.", force=True)
+        tg.action(kind)
+        caption = build_caption(title, platform_line, str(ctx.get("bot_username") or tg.username()))
+        tg.send_file(result, kind, caption=caption, title=title)
+        if not tg.delete(prog.message_id):
+            prog.update("✅ <b>Done!</b>", 100, "Nothing was stored; all files were deleted.", force=True)
+        print("sent")
         return 0
     except UserError as e:
-        tg.edit(status, f"❌ {e}")
+        print(f"user error: {e}", file=sys.stderr)
+        tg.edit(prog.message_id, f"😕 <b>Couldn't finish this one</b>\n\n{esc(str(e))}\n\n{platform_line}",
+                retry_kb)
         return 0  # an expected failure, not a broken workflow
     except Exception as e:
         print(f"Unexpected error: {str(e).replace(token, '***')}", file=sys.stderr)
-        tg.edit(status, "❌ Something went wrong while processing. Try again or try another link.")
+        tg.edit(prog.message_id, "😕 <b>Something went wrong</b>\n\nThe processing step failed unexpectedly. "
+                "Please try again, or try another link.\n\n" + platform_line, retry_kb)
         return 1
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+        release_slot(ctx)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -382,6 +574,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--input", type=Path, help="local media file (skips download and Telegram)")
     ap.add_argument("--url", help="download this URL instead of --input (still no Telegram)")
     ap.add_argument("--action", choices=sorted(ACTIONS), default="video")
+    ap.add_argument("--quality", choices=sorted(QUALITY_FORMATS), default="720")
     ap.add_argument("--text", default="watermark", help="watermark text")
     ap.add_argument("--position", default="bottom-right")
     ap.add_argument("--crop", default="9:16", choices=sorted(CROP_PRESETS))
@@ -396,17 +589,19 @@ def main(argv: list[str] | None = None) -> int:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as tmp:
         workdir = Path(tmp)
-        src = args.input or download(args.url, workdir, audio_only=args.action == "mp3")
-        opts = {"text": args.text, "position": args.position, "preset": args.crop,
-                "max_seconds": args.max_seconds}
         try:
+            src = args.input or download(args.url, workdir, audio_only=args.action == "mp3",
+                                         quality=args.quality,
+                                         on_progress=lambda p: print(f"\rdownloading {p:.0f}%", end=""))
+            opts = {"text": args.text, "position": args.position, "preset": args.crop,
+                    "max_seconds": args.max_seconds}
             result, kind = process(Path(src), workdir, args.action, opts)
         except UserError as e:
             print(f"UserError: {e}", file=sys.stderr)
             return 2
         dst = args.out_dir / result.name
         shutil.copy2(result, dst)
-        print(f"{kind}: {dst} ({human(dst.stat().st_size)})")
+        print(f"\n{kind}: {dst} ({human(dst.stat().st_size)}) title={read_title(workdir)!r}")
     return 0
 
 
