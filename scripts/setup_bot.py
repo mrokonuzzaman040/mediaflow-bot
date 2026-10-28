@@ -6,6 +6,7 @@ Usage (token/secret come from the environment, never from arguments):
   export WEBHOOK_SECRET=...                # same value as the Worker secret
   python scripts/setup_bot.py --profile                        # commands, descriptions, menu button
   python scripts/setup_bot.py --webhook https://mediaflow-bot.<you>.workers.dev
+  python scripts/setup_bot.py --profile --admin-ids 8604335127  # + admin-only /stats /users /recent menu
   python scripts/setup_bot.py --info                           # webhook status (no secrets printed)
   python scripts/setup_bot.py --delete-webhook
 """
@@ -25,6 +26,12 @@ COMMANDS = [
     {"command": "features", "description": "⚙️ What I can do"},
     {"command": "cancel", "description": "❌ Cancel the current menu or input"},
     {"command": "about", "description": "💬 About, privacy & support"},
+]
+
+ADMIN_COMMANDS = COMMANDS + [
+    {"command": "stats", "description": "📊 Usage stats (admin)"},
+    {"command": "users", "description": "👥 Last 10 active users (admin)"},
+    {"command": "recent", "description": "🧾 Last 10 jobs (admin)"},
 ]
 
 DESCRIPTION = (
@@ -69,6 +76,15 @@ def profile() -> None:
     print("profile: commands, description, short description and menu button set")
 
 
+def admin_commands(ids: str) -> None:
+    """Show the admin commands in the menu only in each admin's private chat."""
+    for uid in [x.strip() for x in ids.split(",") if x.strip()]:
+        if not re.fullmatch(r"\d+", uid):
+            sys.exit(f"invalid admin id {uid!r}")
+        api("setMyCommands", {"commands": ADMIN_COMMANDS, "scope": {"type": "chat", "chat_id": int(uid)}})
+        print(f"admin command menu set for {uid}")
+
+
 def webhook(base: str) -> None:
     secret = os.environ.get("WEBHOOK_SECRET", "")
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", secret):
@@ -91,14 +107,17 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--profile", action="store_true")
     ap.add_argument("--webhook", metavar="WORKER_URL")
+    ap.add_argument("--admin-ids", metavar="ID[,ID]", help="show /stats /users /recent in these users' menu")
     ap.add_argument("--info", action="store_true")
     ap.add_argument("--delete-webhook", action="store_true")
     a = ap.parse_args()
-    if not (a.profile or a.webhook or a.info or a.delete_webhook):
+    if not (a.profile or a.webhook or a.info or a.delete_webhook or a.admin_ids):
         ap.print_help()
         return
     if a.profile:
         profile()
+    if a.admin_ids:
+        admin_commands(a.admin_ids)
     if a.delete_webhook:
         api("deleteWebhook", {"drop_pending_updates": True})
         print("webhook deleted")

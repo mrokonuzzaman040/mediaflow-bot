@@ -6,12 +6,21 @@
  *   inline menus that edit the same message in place.
  * - Short-lived state only in KV (every key has a TTL). No media is ever stored.
  * - Per-user rate limit: 1 active job + short cooldown, to protect free quotas.
+ * - Logs users, jobs and command events to D1 (non-blocking, failures ignored).
  * - Hands the heavy work to GitHub Actions via repository_dispatch. The runner
  *   edits the same status message with a progress bar and releases the lock.
  */
 
+import {
+  applyRunnerReport, failJob, insertJob, isBlocked, logEvent, recentText, sha256Hex, statsText,
+  upsertUser, usersText,
+} from "./db";
+
 export interface Env {
   STATE: KVNamespace;
+  DB?: D1Database; // usage database (users, jobs, events)
+  ADMIN_USER_IDS?: string; // comma separated Telegram user ids allowed to use /stats /users /recent
+  TZ_OFFSET_MINUTES?: string; // for admin reports; 360 = Asia/Dhaka
   TELEGRAM_BOT_TOKEN: string;
   WEBHOOK_SECRET: string;
   GITHUB_TOKEN: string;
@@ -43,13 +52,15 @@ interface PendingWatermark { jobId: string; messageId: number }
 interface ActiveLock { token: string; jobId: string; since: number }
 
 // ---- minimal Telegram types -------------------------------------------------
-interface TgUser { id: number; username?: string; first_name?: string }
+interface TgUser { id: number; username?: string; first_name?: string; last_name?: string; language_code?: string; is_premium?: boolean }
 interface TgChat { id: number; type: string }
 interface TgMessage { message_id: number; from?: TgUser; chat: TgChat; text?: string; caption?: string }
 interface TgCallbackQuery { id: string; from: TgUser; message?: TgMessage; data?: string }
 interface TgUpdate { update_id: number; message?: TgMessage; callback_query?: TgCallbackQuery }
 interface InlineButton { text: string; callback_data?: string; url?: string }
 type Keyboard = InlineButton[][];
+/** Run a promise after the response (ctx.waitUntil); errors are logged, never thrown. */
+type Bg = (p: Promise<unknown>) => void;
 
 // ---- helpers ----------------------------------------------------------------
 async function tg(env: Env, method: string, body: Record<string, unknown>): Promise<any> {
@@ -104,6 +115,13 @@ export function extractSupportedUrl(text: string): string | null {
   }
   return null;
 }
+
+export function isAdmin(env: Env, userId: number | undefined): boolean {
+  const list = (env.ADMIN_USER_IDS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  return userId !== undefined && list.includes(String(userId));
+}
+
+const tzOffset = (env: Env) => Number(env.TZ_OFFSET_MINUTES ?? 360) || 0;
 
 export function isAllowed(env: Env, userId: number | undefined): boolean {
   const list = (env.ALLOWED_USER_IDS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
@@ -202,8 +220,8 @@ const ABOUT_TEXT = [
   "MediaFlow is a free, privacy-first media helper.",
   "Runs on Cloudflare Workers + GitHub Actions.",
   "",
-  "🔒 <b>Privacy</b>: no accounts, no history, no stored files.",
-  "Links are kept for at most 30 minutes so menus keep working, then expire.",
+  "🔒 <b>Privacy</b>: no accounts and no stored media files.",
+  "📈 Usage data (your Telegram name/username, the links you send and the actions you pick) is logged to improve the service.",
   "",
   "⚖️ <b>Fair use</b>: only download content you own or have the rights to use.",
   "",
@@ -321,7 +339,8 @@ async function dispatch(env: Env, payload: Record<string, unknown>): Promise<boo
  * is rate-limited (the menu is left untouched in that case).
  */
 async function startJob(env: Env, origin: string, chatId: number, userId: number, jobId: string,
-                        action: Action, options: Record<string, unknown>, messageId: number): Promise<string | null> {
+                        action: Action, options: Record<string, unknown>, messageId: number,
+                        bg: Bg): Promise<string | null> {
   const job = await env.STATE.get<Job>(`job:${jobId}`, "json");
   if (!job) {
     await edit(env, chatId, messageId, "⌛ <b>This menu expired.</b>\nPlease send the link again.");
@@ -329,10 +348,24 @@ async function startJob(env: Env, origin: string, chatId: number, userId: number
   }
   const limited = await rateLimited(env, userId);
   if (limited) return limited;
+  if (env.DB) {
+    try {
+      if (await isBlocked(env.DB, userId)) return "⛔ Sorry, your access to MediaFlow has been restricted.";
+    } catch (err) { console.log(`db isBlocked failed: ${(err as Error).message}`); }
+  }
 
   const label = actionLabel(action, options);
   const p = platformOf(job);
   const token = newId(24);
+  const runId = newId(16);
+  let dbWrite: Promise<unknown> = Promise.resolve();
+  if (env.DB) {
+    const db = env.DB;
+    dbWrite = sha256Hex(token).then((tokenHash) => insertJob(db, {
+      id: runId, menuId: jobId, userId, chatId, url: job.url, platform: p.key, action, options, tokenHash,
+    }));
+    bg(dbWrite);
+  }
   await env.STATE.put(`active:${userId}`, JSON.stringify({ token, jobId, since: Date.now() } satisfies ActiveLock),
     { expirationTtl: ACTIVE_TTL });
   await env.STATE.put(`cool:${userId}`, String(Date.now()), { expirationTtl: COOLDOWN_TTL });
@@ -345,11 +378,15 @@ async function startJob(env: Env, origin: string, chatId: number, userId: number
       job_id: jobId, status_message_id: messageId, user_id: userId,
       platform: p.name, platform_emoji: p.emoji, label,
       bot_username: await botUsername(env),
-      release_url: `${origin}/release`, release_token: token,
+      release_url: `${origin}/release`, release_token: token, run_id: runId,
     },
   });
   if (!ok) {
     await env.STATE.delete(`active:${userId}`);
+    if (env.DB) {
+      const db = env.DB;
+      bg(dbWrite.catch(() => {}).then(() => failJob(db, runId, "dispatch_failed", "GitHub dispatch failed")));
+    }
     await edit(env, chatId, messageId,
       "😕 <b>Couldn't start processing.</b>\nThe processing service didn't accept the job. Please try again in a minute.",
       retryKeyboard(jobId));
@@ -358,14 +395,26 @@ async function startJob(env: Env, origin: string, chatId: number, userId: number
 }
 
 // ---- update handlers --------------------------------------------------------
-async function onMessage(env: Env, origin: string, msg: TgMessage): Promise<void> {
+async function onMessage(env: Env, origin: string, msg: TgMessage, bg: Bg): Promise<void> {
   const chatId = msg.chat.id;
   const text = (msg.text ?? msg.caption ?? "").trim();
+  if (env.DB && msg.from) bg(upsertUser(env.DB, msg.from));
   if (!isAllowed(env, msg.from?.id)) {
     await send(env, chatId, `⛔ <b>This bot is private.</b>\nYour Telegram user id is <code>${msg.from?.id ?? "unknown"}</code>.`);
     return;
   }
   const cmd = text.startsWith("/") ? text.split(/\s+/)[0].split("@")[0].toLowerCase() : "";
+  if (cmd && env.DB) bg(logEvent(env.DB, msg.from?.id, chatId, "command", cmd.slice(0, 32)));
+  if (["/stats", "/users", "/recent"].includes(cmd) && isAdmin(env, msg.from?.id) && env.DB) {
+    try {
+      const report = cmd === "/stats" ? statsText : cmd === "/users" ? usersText : recentText;
+      await send(env, chatId, await report(env.DB, tzOffset(env)));
+    } catch (err) {
+      console.log(`admin report failed: ${(err as Error).message}`);
+      await send(env, chatId, "⚠️ The usage database is unavailable right now.");
+    }
+    return;
+  }
   switch (cmd) {
     case "/start": await send(env, chatId, welcomeText(msg.from?.first_name), homeKeyboard()); return;
     case "/help": await send(env, chatId, HELP_TEXT, backHome()); return;
@@ -388,7 +437,7 @@ async function onMessage(env: Env, origin: string, msg: TgMessage): Promise<void
   if (pending && text && !cmd) {
     await env.STATE.delete(`await:${chatId}`);
     const toast = await startJob(env, origin, chatId, msg.from?.id ?? 0, pending.jobId, "watermark",
-      { text: text.slice(0, 60) }, pending.messageId);
+      { text: text.slice(0, 60) }, pending.messageId, bg);
     if (toast) await send(env, chatId, toast);
     return;
   }
@@ -400,6 +449,7 @@ async function onMessage(env: Env, origin: string, msg: TgMessage): Promise<void
     return;
   }
   await tg(env, "sendChatAction", { chat_id: chatId, action: "typing" });
+  if (env.DB) bg(logEvent(env.DB, msg.from?.id, chatId, "link", url));
   await env.STATE.delete(`await:${chatId}`);
   const jobId = newId();
   const job: Job = { url, chatId, userId: msg.from?.id ?? 0, platform: detectPlatform(url)!.key };
@@ -409,7 +459,8 @@ async function onMessage(env: Env, origin: string, msg: TgMessage): Promise<void
   });
 }
 
-async function onCallback(env: Env, origin: string, cq: TgCallbackQuery): Promise<void> {
+async function onCallback(env: Env, origin: string, cq: TgCallbackQuery, bg: Bg): Promise<void> {
+  if (env.DB) bg(upsertUser(env.DB, cq.from));
   const chatId = cq.message?.chat.id;
   const messageId = cq.message?.message_id;
   const data = cq.data ?? "";
@@ -441,7 +492,7 @@ async function onCallback(env: Env, origin: string, cq: TgCallbackQuery): Promis
     }
     const uid = cq.from.id;
     const run = async (action: Action, options: Record<string, unknown>) => {
-      const limited = await startJob(env, origin, chatId, uid, jobId, action, options, messageId);
+      const limited = await startJob(env, origin, chatId, uid, jobId, action, options, messageId, bg);
       if (limited) { toast = limited; alert = true; } else toast = "🚀 Job started";
     };
 
@@ -516,21 +567,36 @@ async function onCallback(env: Env, origin: string, cq: TgCallbackQuery): Promis
   }
 }
 
-/** Called by the GitHub runner when a job ends, to free the user's job slot. */
+/**
+ * Called by the GitHub runner: {status: "running"} when it starts, and
+ * {status: "done"|"failed", ...details} when it ends (which also frees the
+ * user's job slot). Authenticated by the one-time per-job token.
+ */
 async function onRelease(env: Env, request: Request): Promise<Response> {
   let body: any;
   try { body = await request.json(); } catch { return new Response("bad request", { status: 400 }); }
   const uid = Number(body?.user_id);
   const token = String(body?.token ?? "");
   if (!Number.isInteger(uid) || !token) return new Response("bad request", { status: 400 });
+  let reported = false;
+  if (env.DB && body.run_id && body.status) {
+    try { reported = await applyRunnerReport(env.DB, body); } catch (err) {
+      console.log(`db report failed: ${(err as Error).message}`);
+    }
+  }
+  if (body.status === "running") {
+    return reported ? new Response("ok") : new Response("forbidden", { status: 403 });
+  }
   const lock = await env.STATE.get<ActiveLock>(`active:${uid}`, "json");
-  if (!lock || !safeEqual(lock.token, token)) return new Response("forbidden", { status: 403 });
-  await env.STATE.delete(`active:${uid}`);
-  return new Response("released");
+  const released = !!lock && safeEqual(lock.token, token);
+  if (released) await env.STATE.delete(`active:${uid}`);
+  if (!released && !reported) return new Response("forbidden", { status: 403 });
+  return new Response(released ? "released" : "recorded");
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const bg: Bg = (p) => ctx.waitUntil(p.catch((err) => console.log(`background task failed: ${(err as Error)?.message}`)));
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/") {
       return new Response("MediaFlow bot is running."); // health check
@@ -550,8 +616,8 @@ export default {
       return new Response("bad request", { status: 400 });
     }
     try {
-      if (update.message) await onMessage(env, url.origin, update.message);
-      else if (update.callback_query) await onCallback(env, url.origin, update.callback_query);
+      if (update.message) await onMessage(env, url.origin, update.message, bg);
+      else if (update.callback_query) await onCallback(env, url.origin, update.callback_query, bg);
     } catch (err) {
       console.log(`handler error: ${(err as Error).message}`);
     }

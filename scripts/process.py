@@ -47,7 +47,14 @@ FONT_CANDIDATES = (
 
 
 class UserError(Exception):
-    """An error whose message is safe and useful to show to the Telegram user."""
+    """An error whose message is safe and useful to show to the Telegram user.
+
+    code is a short machine-readable reason stored in the usage database.
+    """
+
+    def __init__(self, message: str, code: str = "user_error"):
+        super().__init__(message)
+        self.code = code
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -109,34 +116,41 @@ QUALITY_FORMATS = {
 }
 
 # (pattern in yt-dlp output, friendly message for the user)
+# (pattern in yt-dlp output, error code, friendly message for the user)
 DOWNLOAD_ERRORS = (
-    (r"confirm you.re not a bot|sign in to confirm", "🤖 The site asked for a bot check and blocked the "
-     "download server. The bot owner can fix this by adding a YT_DLP_COOKIES secret."),
+    (r"confirm you.re not a bot|sign in to confirm", "bot_check", "🤖 The site asked for a bot check and "
+     "blocked the download server. The bot owner can fix this by adding a YT_DLP_COOKIES secret."),
     (r"private (video|account|post)|this account is private|login required|log in|"
-     r"you need to log in|requires authentication|members.only",
+     r"you need to log in|requires authentication|members.only", "private",
      "🔐 This post is private or needs a login, so it can't be downloaded."),
-    (r"age.restricted|confirm your age|inappropriate for some users",
+    (r"age.restricted|confirm your age|inappropriate for some users", "age_restricted",
      "🔞 This video is age-restricted and needs a signed-in account."),
-    (r"available in your country|geo.?restrict|blocked it in your country",
+    (r"available in your country|geo.?restrict|blocked it in your country", "geo_blocked",
      "🌍 This video isn't available in the download server's region."),
-    (r"video unavailable|has been removed|does not exist|404|no longer available|deleted",
+    (r"video unavailable|has been removed|does not exist|404|no longer available|deleted", "unavailable",
      "🚫 This video is unavailable. It may have been removed or the link is wrong."),
-    (r"no video formats found|there is no video in this post|unsupported url",
+    (r"no video formats found|there is no video in this post|unsupported url", "no_video",
      "🎞 I couldn't find a downloadable video in that post."),
-    (r"live event|is live|premieres in", "📡 Live streams and premieres can't be downloaded."),
-    (r"rate.?limit|too many requests|http error 429",
+    (r"live event|is live|premieres in", "live", "📡 Live streams and premieres can't be downloaded."),
+    (r"rate.?limit|too many requests|http error 429", "rate_limited",
      "🚦 The site is rate-limiting downloads right now. Please try again in a few minutes."),
-    (r"cookies", "🔐 The site requires a login (cookies) for this link."),
+    (r"cookies", "login_required", "🔐 The site requires a login (cookies) for this link."),
 )
 
 PROGRESS_PREFIX = "MFPROG"
 
 
-def friendly_download_error(output: str) -> str | None:
-    for pattern, message in DOWNLOAD_ERRORS:
+def classify_download_error(output: str) -> tuple[str, str] | None:
+    """Return (error_code, friendly message) for known yt-dlp failures."""
+    for pattern, code, message in DOWNLOAD_ERRORS:
         if re.search(pattern, output, re.I):
-            return message
+            return code, message
     return None
+
+
+def friendly_download_error(output: str) -> str | None:
+    found = classify_download_error(output)
+    return found[1] if found else None
 
 
 def download(url: str, workdir: Path, *, audio_only: bool = False, quality: str = "720",
@@ -147,7 +161,8 @@ def download(url: str, workdir: Path, *, audio_only: bool = False, quality: str 
     is written to workdir/title.txt.
     """
     if not is_supported_url(url):
-        raise UserError("🔗 Unsupported link. Send a YouTube, TikTok, Instagram, Facebook or X link.")
+        raise UserError("🔗 Unsupported link. Send a YouTube, TikTok, Instagram, Facebook or X link.",
+                        "unsupported_url")
     out_tmpl = str(workdir / "source.%(ext)s")
     cmd = ["yt-dlp", "--no-playlist", "--restrict-filenames", "--no-warnings", "--newline",
            "--progress", "--progress-template", f"download:{PROGRESS_PREFIX} %(progress._percent_str)s",
@@ -180,15 +195,15 @@ def download(url: str, workdir: Path, *, audio_only: bool = False, quality: str 
     output = "\n".join(tail)
     if rc != 0:
         if "File is larger than max-filesize" in output:
-            raise UserError("📦 That video is too large to process (over 1.5 GB).")
-        friendly = friendly_download_error(output)
+            raise UserError("📦 That video is too large to process (over 1.5 GB).", "too_large")
+        found = classify_download_error(output)
         print("yt-dlp failed:\n" + "\n".join(tail[-15:]), file=sys.stderr)
-        if friendly:
-            raise UserError(friendly)
+        if found:
+            raise UserError(found[1], found[0])
         raise RuntimeError(f"yt-dlp failed (exit {rc})")
     files = [p for p in workdir.glob("source.*") if p.suffix not in (".part", ".ytdl")]
     if not files:
-        raise UserError("🎞 Nothing was downloaded from that link.")
+        raise UserError("🎞 Nothing was downloaded from that link.", "no_video")
     return max(files, key=lambda p: p.stat().st_size)
 
 
@@ -229,7 +244,7 @@ def _encode_video(src: Path, dst: Path, vf: str | None = None, *, max_height: in
 def to_mp3(src: Path, workdir: Path, bitrate_kbps: int = 192) -> Path:
     """Extract audio as MP3, lowering the bitrate if needed to fit Telegram's limit."""
     if not has_audio(src):
-        raise UserError("🔇 This media has no audio track, so there's nothing to convert to MP3.")
+        raise UserError("🔇 This media has no audio track, so there's nothing to convert to MP3.", "no_audio")
     duration = probe_duration(src)
     if duration > 0:
         max_kbps = int(TARGET_BYTES * 8 / duration / 1000)
@@ -280,14 +295,14 @@ def frames(src: Path, workdir: Path, max_seconds: int = MAX_FRAMES_SECONDS, fps:
              "-q:v", str(q), str(fdir / "frame_%04d.jpg")])
         imgs = sorted(fdir.glob("*.jpg"))
         if not imgs:
-            raise UserError("Could not extract any frames from this media.")
+            raise UserError("🖼 Could not extract any frames from this media.", "no_frames")
         zpath = workdir / "frames.zip"
         with zipfile.ZipFile(zpath, "w", zipfile.ZIP_STORED) as zf:  # JPEGs don't compress further
             for i, img in enumerate(imgs):
                 zf.write(img, f"second_{i:04d}.jpg")
         if zpath.stat().st_size <= TARGET_BYTES:
             return zpath
-    raise UserError("The frames archive is larger than Telegram's 50 MB limit.")
+    raise UserError("📦 The frames archive is larger than Telegram's 50 MB limit.", "too_large")
 
 
 def fit_video(path: Path, workdir: Path) -> Path:
@@ -296,7 +311,7 @@ def fit_video(path: Path, workdir: Path) -> Path:
         return path
     duration = probe_duration(path)
     if duration <= 0:
-        raise UserError("Result is over 50 MB and its length is unknown, so it can't be shrunk.")
+        raise UserError("📦 The result is over 50 MB and its length is unknown, so it can't be shrunk.", "too_large")
     audio_kbps = 96 if has_audio(path) else 0
     for i, max_h in enumerate((720, 480, 360)):
         total_kbps = TARGET_BYTES * 8 * 0.93 / duration / 1000
@@ -308,7 +323,7 @@ def fit_video(path: Path, workdir: Path) -> Path:
         if out.stat().st_size <= TARGET_BYTES:
             return out
     raise UserError(f"The video is too long to fit Telegram's 50 MB bot limit "
-                    f"({duration / 60:.0f} min). Try 🎵 MP3 Audio or a shorter clip.")
+                    f"({duration / 60:.0f} min). Try 🎵 MP3 Audio or a shorter clip.", "too_large")
 
 
 def process(src: Path, workdir: Path, action: str, options: dict) -> tuple[Path, str]:
@@ -421,7 +436,8 @@ class Telegram:
 
     def send_file(self, path: Path, kind: str, caption: str = "", title: str = "") -> None:
         if path.stat().st_size > TELEGRAM_LIMIT_BYTES:
-            raise UserError(f"📦 The result is {human(path.stat().st_size)}, over Telegram's 50 MB bot limit.")
+            raise UserError(f"📦 The result is {human(path.stat().st_size)}, over Telegram's 50 MB bot limit.",
+                            "too_large")
         method, field = {"video": ("sendVideo", "video"), "audio": ("sendAudio", "audio")}.get(
             kind, ("sendDocument", "document"))
         data = {"chat_id": self.chat_id, "caption": caption[:1024], "parse_mode": "HTML"}
@@ -492,17 +508,19 @@ def load_job_from_github_event() -> dict:
     return payload
 
 
-def release_slot(ctx: dict) -> None:
-    """Tell the Worker this user's job finished so they can start another one."""
+def notify_worker(ctx: dict, status: str, **fields) -> None:
+    """Report job status to the Worker (usage DB). A final status also frees the user's job slot."""
     url, token = ctx.get("release_url"), ctx.get("release_token")
     if not url or not token or not str(url).startswith("https://"):
         return
+    body = {"user_id": ctx.get("user_id"), "token": token, "run_id": ctx.get("run_id"), "status": status,
+            **{k: v for k, v in fields.items() if v is not None}}
     try:
         import requests
-        r = requests.post(url, json={"user_id": ctx.get("user_id"), "token": token}, timeout=15)
-        print(f"release: HTTP {r.status_code}")
+        r = requests.post(url, json=body, timeout=15)
+        print(f"report {status}: HTTP {r.status_code}")
     except Exception as e:
-        print(f"release failed: {type(e).__name__}", file=sys.stderr)
+        print(f"report {status} failed: {type(e).__name__}", file=sys.stderr)
 
 
 def run_github_job() -> int:
@@ -515,7 +533,7 @@ def run_github_job() -> int:
     ctx = job.get("ctx") or {}
     if not token or not re.fullmatch(r"-?\d+", chat_id) or action not in ACTIONS:
         print("Invalid job payload or missing TELEGRAM_BOT_TOKEN", file=sys.stderr)
-        release_slot(ctx)
+        notify_worker(ctx, "failed", error_code="invalid_payload")
         return 1
     tg = Telegram(token, chat_id)
     platform_line = f"{ctx.get('platform_emoji', '🎬')} {esc(str(ctx.get('platform', 'Media')))}  ·  " \
@@ -525,6 +543,10 @@ def run_github_job() -> int:
     job_id = str(ctx.get("job_id") or "")
     retry_kb = [[{"text": "🔁 Try again", "callback_data": f"r:{job_id}"}]] if re.fullmatch(
         r"[a-z0-9]{6,16}", job_id) else None
+    import time
+    started = time.monotonic()
+    notify_worker(ctx, "running")
+    report: dict = {"status": "failed", "error_code": "unexpected"}
     prog = Progress(tg, status_id, platform_line)
     prog.update("🔧 <b>Preparing…</b>", 5, "Server is ready, fetching your media.", force=True)
 
@@ -542,6 +564,8 @@ def run_github_job() -> int:
             cookies.unlink(missing_ok=True)
         print(f"downloaded {human(src.stat().st_size)}")
         title = read_title(workdir)
+        report["title"] = title or None
+        report["duration_sec"] = round(probe_duration(src), 2) or None
         prog.update("⚙️ <b>Processing…</b>", 70, "Applying your edit with ffmpeg.", force=True)
         result, kind = process(src, workdir, action, options)
         print(f"processed -> {kind} {human(result.stat().st_size)}")
@@ -549,23 +573,27 @@ def run_github_job() -> int:
         tg.action(kind)
         caption = build_caption(title, platform_line, str(ctx.get("bot_username") or tg.username()))
         tg.send_file(result, kind, caption=caption, title=title)
+        report.update(status="done", error_code=None, file_size=result.stat().st_size)
         if not tg.delete(prog.message_id):
             prog.update("✅ <b>Done!</b>", 100, "Nothing was stored; all files were deleted.", force=True)
         print("sent")
         return 0
     except UserError as e:
         print(f"user error: {e}", file=sys.stderr)
+        report.update(error_code=e.code, error_message=str(e)[:300])
         tg.edit(prog.message_id, f"😕 <b>Couldn't finish this one</b>\n\n{esc(str(e))}\n\n{platform_line}",
                 retry_kb)
         return 0  # an expected failure, not a broken workflow
     except Exception as e:
         print(f"Unexpected error: {str(e).replace(token, '***')}", file=sys.stderr)
+        report.update(error_code="unexpected", error_message=type(e).__name__)
         tg.edit(prog.message_id, "😕 <b>Something went wrong</b>\n\nThe processing step failed unexpectedly. "
                 "Please try again, or try another link.\n\n" + platform_line, retry_kb)
         return 1
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
-        release_slot(ctx)
+        report["processing_ms"] = int((time.monotonic() - started) * 1000)
+        notify_worker(ctx, report.pop("status"), **report)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -168,6 +168,7 @@ class UxTests(unittest.TestCase):
             with self.subTest(out=out):
                 self.assertIn(needle, P.friendly_download_error(out) or "")
         self.assertIsNone(P.friendly_download_error("ERROR: something odd"))
+        self.assertEqual(P.classify_download_error("Sign in to confirm you're not a bot")[0], "bot_check")
 
     def test_progress_throttles_edits(self):
         t = [0.0]
@@ -191,13 +192,19 @@ class GithubJobTests(unittest.TestCase):
         self.tmp = Path(self._tmp.name)
         self.sample = make_sample(self.tmp / "s.mp4", seconds=3)
         self.released = []
-        self._orig = (P.Telegram, P.download, P.release_slot)
+        self.reports = []
+        self._orig = (P.Telegram, P.download, P.notify_worker)
         FakeTelegram.instances.clear()
         P.Telegram = FakeTelegram
-        P.release_slot = lambda ctx: self.released.append(ctx.get("release_token"))
+
+        def fake_notify(ctx, status, **fields):
+            self.reports.append((status, fields))
+            if status != "running":
+                self.released.append(ctx.get("release_token"))
+        P.notify_worker = fake_notify
 
     def tearDown(self):
-        P.Telegram, P.download, P.release_slot = self._orig
+        P.Telegram, P.download, P.notify_worker = self._orig
         self._tmp.cleanup()
 
     def run_job(self, action="mp3", options=None):
@@ -206,7 +213,8 @@ class GithubJobTests(unittest.TestCase):
                                     "ctx": {"job_id": "abcdef123456", "status_message_id": 8, "user_id": 42,
                                             "platform": "YouTube", "platform_emoji": "▶️",
                                             "label": "🎵 MP3 Audio", "bot_username": "mediaflobot",
-                                            "release_url": "https://w.dev/release", "release_token": "tok"}}}
+                                            "release_url": "https://w.dev/release", "release_token": "tok",
+                                            "run_id": "run123456789"}}}
         ev = self.tmp / "event.json"
         ev.write_text(json.dumps(event))
         env = {"GITHUB_EVENT_PATH": str(ev), "TELEGRAM_BOT_TOKEN": "123:abc", "RUNNER_TEMP": str(self.tmp)}
@@ -242,10 +250,18 @@ class GithubJobTests(unittest.TestCase):
         self.assertIn("⚡ via @mediaflobot", sent[3])
         self.assertEqual(calls[-1], ("delete", 8))
         self.assertEqual(self.released, ["tok"])
+        self.assertEqual(self.reports[0], ("running", {}))
+        status, fields = self.reports[-1]
+        self.assertEqual(status, "done")
+        self.assertEqual(fields["title"], "My <Clip>")
+        self.assertGreater(fields["file_size"], 0)
+        self.assertAlmostEqual(fields["duration_sec"], 3, delta=0.5)
+        self.assertGreaterEqual(fields["processing_ms"], 0)
+        self.assertIsNone(fields.get("error_code"))
 
     def test_user_error_shows_try_again(self):
         def fake_download(url, workdir, **kw):
-            raise P.UserError("🔐 This post is private or needs a login, so it can't be downloaded.")
+            raise P.UserError("🔐 This post is private or needs a login, so it can't be downloaded.", "private")
         P.download = fake_download
         rc, calls = self.run_job()
         self.assertEqual(rc, 0)
@@ -253,6 +269,8 @@ class GithubJobTests(unittest.TestCase):
         self.assertIn("private", last[2])
         self.assertEqual(last[3], [[{"text": "🔁 Try again", "callback_data": "r:abcdef123456"}]])
         self.assertEqual(self.released, ["tok"])
+        self.assertEqual(self.reports[-1][0], "failed")
+        self.assertEqual(self.reports[-1][1]["error_code"], "private")
 
 
 if __name__ == "__main__":

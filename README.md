@@ -14,9 +14,10 @@ and shows a menu:
 | 🖼 Frames (1/sec) | 1 JPEG per second (first 60 s) in a ZIP |
 | ❌ Cancel | Closes the menu |
 
-**Cost: $0.** Nothing is stored permanently. Media only lives on the throwaway GitHub runner
-while it's processed and is deleted afterwards. Cloudflare KV only holds short-lived state, and
-every key has a TTL (link/menu 30 min, watermark prompt 10 min, job lock 15 min, cooldown 1 min).
+**Cost: $0.** Media is never stored. It only lives on the throwaway GitHub runner while it's
+processed and is deleted afterwards. Cloudflare KV holds short-lived state with a TTL on every key
+(link/menu 30 min, watermark prompt 10 min, job lock 15 min, cooldown 1 min). Usage data
+(users, jobs, command events) is kept in Cloudflare D1 (see below).
 
 > ⚠️ Only download content you own or have the rights to use. Most platforms' terms forbid
 > downloading other people's posts.
@@ -37,6 +38,40 @@ every key has a TTL (link/menu 30 min, watermark prompt 10 min, job lock 15 min,
   one-time random token. If a runner dies, the slot expires by itself after 15 min.
 - **Bot profile** (commands menu, description, short description, menu button) is set by
   `scripts/setup_bot.py --profile`.
+
+## Usage database (Cloudflare D1, free)
+Database `mediaflow-db`, bound to the Worker as `DB`. Schema in `worker/migrations/`.
+
+| Table | What's stored |
+|---|---|
+| `users` | Telegram user id (PK), username, first/last name, language, premium flag, first/last seen, total jobs, `is_blocked` |
+| `jobs` | One row per started job: user/chat id, link, platform, action, options (JSON), status `queued → running → done/failed`, error code/message, title, file size, source duration, created/started/finished time, processing ms |
+| `events` | Commands (`/start`, `/help`, …) and links sent, with timestamps |
+
+Indexes cover `user_id`, `created_at` and `platform`. Timestamps are unix seconds (UTC).
+No media and no credentials are stored. The runner's one-time callback token is stored only as
+a SHA-256 hash.
+
+- The Worker upserts the user on every message/button press and inserts a `jobs` row when a job
+  starts. These writes run in `ctx.waitUntil`, so they never slow down or break the bot. If D1 is
+  down, the bot keeps working.
+- The GitHub runner reports `running` when it starts and `done`/`failed` (with error code, title,
+  size, duration, processing time) when it ends, via the Worker's `/release` endpoint.
+- Block a user: `npx wrangler d1 execute mediaflow-db --remote --command "UPDATE users SET is_blocked=1 WHERE user_id=123"`.
+
+**Admin commands** (only for ids in `ADMIN_USER_IDS` in `wrangler.toml`; others get the normal
+"unknown" reply):
+- `/stats`: users (total, active today, new today/7d), jobs (today/7d/all), success rate,
+  average processing time, top platforms and actions. "Today" uses `TZ_OFFSET_MINUTES` (360 = Dhaka).
+- `/users`: last 10 active users. `/recent`: last 10 jobs.
+
+Set up / change:
+```bash
+cd worker
+npx wrangler d1 create mediaflow-db            # once; put the id in wrangler.toml
+npx wrangler d1 migrations apply mediaflow-db --remote
+npx wrangler d1 execute mediaflow-db --remote --command "SELECT COUNT(*) FROM jobs"
+```
 
 ## How it works
 
@@ -59,8 +94,10 @@ scripts/requirements.txt        yt-dlp, requests
 scripts/setup_bot.py            bot profile (commands, descriptions, menu button) + webhook
 tests/test_process.py           local ffmpeg tests (generated sample video)
 worker/src/index.ts             Cloudflare Worker (Telegram webhook)
+worker/src/db.ts                D1 usage database helpers + admin reports
+worker/migrations/              D1 schema (users, jobs, events)
 worker/wrangler.toml            Worker config (KV binding, vars)
-worker/test/worker.test.mjs     Worker tests (mocked Telegram/GitHub/KV)
+worker/test/worker.test.mjs     Worker tests (mocked Telegram/GitHub/KV, in-memory SQLite D1 via sql.js)
 ```
 
 ## Setup (about 20 minutes, all free)
@@ -133,7 +170,7 @@ npx wrangler deploy
 cd ..
 export TELEGRAM_BOT_TOKEN='123456789:AA...'
 export WEBHOOK_SECRET='the-same-random-string'
-python scripts/setup_bot.py --profile --webhook https://mediaflow-bot.<you>.workers.dev --info
+python scripts/setup_bot.py --profile --admin-ids <your-telegram-id> --webhook https://mediaflow-bot.<you>.workers.dev --info
 ```
 `--info` prints only the webhook url, pending update count and last error.
 
@@ -166,6 +203,7 @@ cd worker && npm install && npm run check && npm test
 - **Frames**: first 60 seconds only (`FRAMES_MAX_SECONDS` in `wrangler.toml`, max 60).
 - Only the **first video** of a carousel/playlist is processed.
 - GitHub Actions jobs take about 30–60 s to start, so expect 1–3 minutes per request.
+- Free D1: 5 GB, 5M row reads/day, 100k row writes/day (about 3–4 writes per job).
 - Free Cloudflare plan: 100k Worker requests/day, KV 1,000 writes/day (about 5–6 writes per
   link + job, including deletes), so roughly 150+ jobs a day. Plenty for personal or small-team use.
 - Sites change often. The workflow always installs the latest `yt-dlp`; if a site breaks,
